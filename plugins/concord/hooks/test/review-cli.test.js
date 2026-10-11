@@ -4512,6 +4512,24 @@ test('gate-panel-round-record: two consecutive dry rounds -> status "done" and l
 
 
 
+test('review-cli --help, -h and help list every dispatched verb and exit 0; an unknown verb still fails listing them (#331)', () => {
+  const env = { ...process.env, REVIEW_STATE_DIR: tmpDir(), REVIEW_REPO_ROOT: initRepo() };
+  const source = fs.readFileSync(path.join(__dirname, '../../core/review-cli.js'), 'utf8');
+  const runLevel = [...source.match(/RUN_VERBS = new Set\(\[([^\]]*)\]/)[1].matchAll(/'([a-z-]+)'/g)].map((m) => m[1]);
+  const dispatched = [...new Set([...source.matchAll(/\bverb === '([a-z-]+)'/g)].map((m) => m[1]).concat(runLevel, 'feedback'))].sort();
+  assert.ok(dispatched.length > 20);
+  for (const word of ['--help', '-h', 'help']) {
+    const { stdout, stderr, status } = runCapture([word], { env });
+    assert.strictEqual(status, 0, `${word}: ${stderr}`);
+    assert.doesNotMatch(stdout + stderr, /unknown/i);
+    const listed = stdout.split('\n').slice(2).filter(Boolean).map((line) => line.trim().split(/\s+/)[0]).sort();
+    assert.deepStrictEqual(listed, dispatched, word);
+  }
+  const { stderr, status } = runCapture(['bogus-verb'], { env });
+  assert.notStrictEqual(status, 0);
+  assert.match(stderr, /unknown verb "bogus-verb" \(expected show \|/);
+});
+
 test('review-cli: unknown verb error message lists the two new gate-panel verbs', () => {
   const repo = initRepo(); const dir = tmpDir();
   const env = { ...process.env, REVIEW_STATE_DIR: dir, REVIEW_REPO_ROOT: repo };
@@ -5685,6 +5703,26 @@ test('plan-fixes does not stamp a cleared finding the gate raised again and gate
   assert.doesNotMatch(text, /not re-raised/);
 });
 
+test('plan-fixes does not stamp a cleared finding the gate raised again but the fold dropped as dismissed as not re-raised (#283)', () => {
+  const repo = initRepo();
+  const dir = tmpDir();
+  const env = { ...process.env, REVIEW_STATE_DIR: dir, REVIEW_REPO_ROOT: repo };
+  fs.writeFileSync(path.join(repo, 'review.config.json'), JSON.stringify({ dod: ['true'], gate: {} }));
+  execFileSync('git', ['commit', '-aqm', 'enable gate'], { cwd: repo });
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'two\n');
+  execFileSync('git', ['commit', '-aqm', 'change'], { cwd: repo });
+  const n = JSON.parse(run(['round-start', 'feat/x', 'HEAD~1'], { env, broadDefault: true })).round;
+  const slug = review.targetSlug('feat/x');
+  const cleared = { id: 'gate:cross-context:dismissed', file: 'a.txt', span: 'two', summary: 'a real gap', rationale: 'r', releaseBlocking: ['serious-bug'], clearedAt: '2026-10-09T00:00:00.000Z' };
+  review.writeLedger(dir, slug, { ...review.readLedger(dir, slug), gate_cleared: [cleared], gate_dismissed: [{ ...cleared, dismissedBy: 'user' }] });
+  fs.writeFileSync(path.join(dir, `round-${n}-correctness.json`), JSON.stringify({ status: 'ok', examined: ['a.txt'], findings: [] }));
+  fs.writeFileSync(path.join(dir, `round-${n}-gate.json`), JSON.stringify({ status: 'ok', findings: [{ id: cleared.id, file: 'a.txt', span: 'two', summary: 'a real gap' }] }));
+  fs.writeFileSync(path.join(dir, `round-${n}-verify.json`), JSON.stringify({ status: 'ok', rejected: [] }));
+  fs.writeFileSync(path.join(dir, `round-${n}-gate-verify.json`), JSON.stringify({ status: 'ok', rejected: [] }));
+  run(['plan-fixes', 'feat/x'], { env });
+  assert.strictEqual(review.readLedger(dir, slug).gate_cleared[0].notRaisedRound ?? null, null);
+});
+
 test('plan-fixes does not read a cleared finding dropped as a duplicate of a correctness finding as rejected by gate-verify', () => {
   const repo = initRepo();
   const dir = tmpDir();
@@ -5725,6 +5763,8 @@ function recordFixRepo({ ledger, test = 'grep -q fixed a.txt' } = {}) {
   review.writeLedger(dir, slug, { ...base, ...ledger(reviewed) });
   return { dir, repo, slug, reviewed, fix, env: { ...process.env, REVIEW_STATE_DIR: dir, REVIEW_REPO_ROOT: repo } };
 }
+// The merge record runs on a done panel before it counts gate_open.
+const mergedGateIds = (l) => (l.gate_panel.status === 'done' ? require('../../core/gate-panel').mergePanelIntoGate(l.gate_open, l.gate_panel.confirmed || [], []) : l.gate_open).map((f) => f.id);
 const BLOCKING_GATE = (id) => ({ id, file: 'a.txt', span: '1', summary: 's', rationale: '', releaseBlocking: ['serious-bug'] });
 const recordFixArgs = (fix, extra = []) => ['record-fix', 'feat/x', 'gate:silent-gap:x', '--commit', fix, '--test', 'sh check.sh', '--test-file', 'check.sh', ...extra];
 const runFails = (args, env) => spawnSync('node', [CLI, ...args], { encoding: 'utf8', env });
@@ -5878,14 +5918,10 @@ test('record-fix on the last blocking gate finding of a parked run resets the pa
   run(recordFixArgs(t.fix), { env: t.env });
   const after = review.readLedger(t.dir, t.slug);
   assert.strictEqual(after.status, 'converging');
-  // The merge record runs on a done panel before it counts gate_open.
-  const merged = after.gate_panel.status === 'done' ? gatePanel.mergePanelIntoGate(after.gate_open, after.gate_panel.confirmed || [], []) : after.gate_open;
-  assert.deepStrictEqual(merged.map((f) => f.id), []);
+  assert.deepStrictEqual(mergedGateIds(after), []);
   assert.deepStrictEqual(after.gate_panel, gatePanel.emptyGatePanel());
 });
 
-// The merge record runs on a done panel before it counts gate_open.
-const mergedGateIds = (l) => (l.gate_panel.status === 'done' ? require('../../core/gate-panel').mergePanelIntoGate(l.gate_open, l.gate_panel.confirmed || [], []) : l.gate_open).map((f) => f.id);
 const parkedWithConfirmedGate = () => ({ status: 'parked', findings: [{ id: 'correctness:p', file: 'a.txt', summary: 's', status: 'parked', park_reason: 'needs-decision' }], gate_open: [BLOCKING_GATE('gate:silent-gap:x')], gate_panel: { ...require('../../core/gate-panel').emptyGatePanel(), status: 'done', confirmed: [BLOCKING_GATE('gate:silent-gap:x')] } });
 
 test('record-fix on a gate finding of a run that stays parked resets the panel, so record-fix on the parked finding cannot merge it back', () => {
@@ -5940,6 +5976,95 @@ test('rerun keeps the record-fix evidence of a parked finding', () => {
   run(['record-fix', 'feat/x', 'correctness:x', '--commit', t.fix, '--test', 'sh check.sh', '--test-file', 'check.sh'], { env: t.env });
   run(['rerun', 'feat/x'], { env: t.env });
   assert.strictEqual(review.readLedger(t.dir, t.slug).runs[0].fixed[0].fix_evidence.command, 'sh check.sh');
+});
+
+const PARKED_P = { id: 'correctness:p', file: 'a.txt', summary: 's', status: 'parked', park_reason: 'needs-decision' };
+const dismissG = (t, id = 'gate:silent-gap:x') => run(['dismiss', 'feat/x', id, '--by', 'user'], { env: t.env });
+const recordFixP = (t) => run(['record-fix', 'feat/x', 'correctness:p', '--commit', t.fix, '--test', 'sh check.sh', '--test-file', 'check.sh'], { env: t.env });
+
+test('dismiss leaves a parked stop once no parked finding and no blocking gate finding is left (#293)', () => {
+  const t = recordFixRepo({ ledger: () => ({ status: 'parked', findings: [PARKED_P], gate_open: [BLOCKING_GATE('gate:silent-gap:x')] }) });
+  dismissG(t);
+  assert.strictEqual(review.readLedger(t.dir, t.slug).status, 'parked', 'P is still parked');
+  recordFixP(t);
+  const after = review.readLedger(t.dir, t.slug);
+  assert.strictEqual(after.status, 'converging');
+  const u = recordFixRepo({ ledger: () => ({ status: 'parked', findings: [PARKED_P], gate_open: [BLOCKING_GATE('gate:silent-gap:x')] }) });
+  recordFixP(u);
+  assert.strictEqual(review.readLedger(u.dir, u.slug).status, 'parked', 'G is still blocking');
+  dismissG(u);
+  const left = review.readLedger(u.dir, u.slug);
+  assert.strictEqual(left.status, 'converging');
+  assert.ok(!left.retry_diff_base, 'a parked run leaves its stop as unpark would, without a retry base');
+});
+
+test('dismiss of the last blocking gate finding leaves gate-pending with the reviewed head as retry base (#293)', () => {
+  const t = recordFixRepo({ ledger: () => ({ status: 'gate-pending', gate_open: [BLOCKING_GATE('gate:silent-gap:x'), BLOCKING_GATE('gate:silent-gap:y')] }) });
+  dismissG(t);
+  assert.strictEqual(review.readLedger(t.dir, t.slug).status, 'gate-pending');
+  dismissG(t, 'gate:silent-gap:y');
+  const after = review.readLedger(t.dir, t.slug);
+  assert.deepStrictEqual([after.status, after.retry_diff_base, after.diff_content_hash], ['converging', t.reviewed, null]);
+});
+
+test('dismiss of a follow-up eligible gate finding does not leave a stop that has another reason (#293)', () => {
+  const eligible = { ...BLOCKING_GATE('gate:silent-gap:x'), releaseBlocking: [], rationale: 'r' };
+  const t = recordFixRepo({ ledger: () => ({ status: 'parked', findings: [], gate_open: [eligible] }) });
+  dismissG(t);
+  assert.strictEqual(review.readLedger(t.dir, t.slug).status, 'parked');
+});
+
+test('a gate_fixed finding raised again and cleared by a gate-pending restart is not reported as fixed (#293)', () => {
+  const t = recordFixRepo({ ledger: () => ({ status: 'gate-pending', gate_open: [BLOCKING_GATE('gate:silent-gap:x'), BLOCKING_GATE('gate:silent-gap:y')] }) });
+  run(recordFixArgs(t.fix), { env: t.env });
+  const fixed = review.readLedger(t.dir, t.slug);
+  assert.deepStrictEqual(fixed.gate_fixed.map((f) => f.id), ['gate:silent-gap:x']);
+  review.writeLedger(t.dir, t.slug, { ...fixed, gate_open: [BLOCKING_GATE('gate:silent-gap:x'), BLOCKING_GATE('gate:silent-gap:y')], diff_content_hash: 'stale' });
+  run(['round-start', 'feat/x', 'HEAD~1'], { env: t.env });
+  const after = review.readLedger(t.dir, t.slug);
+  assert.deepStrictEqual(after.gate_cleared.map((f) => f.id).sort(), ['gate:silent-gap:x', 'gate:silent-gap:y']);
+  assert.doesNotMatch(cli.renderHandoff({ ledger: after }), /fixed outside the loop: \[gate:silent-gap:x\]/);
+  run(['rerun', 'feat/x'], { env: t.env });
+  assert.deepStrictEqual(review.readLedger(t.dir, t.slug).runs[0].fixed, []);
+});
+
+test('a finding cleared at a restart and then recorded as fixed is reported once, as fixed (#293)', () => {
+  const t = recordFixRepo({ ledger: () => ({ status: 'gate-pending', gate_open: [BLOCKING_GATE('gate:silent-gap:x'), BLOCKING_GATE('gate:silent-gap:y')], gate_cleared: [{ ...BLOCKING_GATE('gate:silent-gap:x'), clearedAt: '2026-10-09T00:00:00.000Z' }] }) });
+  run(recordFixArgs(t.fix), { env: t.env });
+  const after = review.readLedger(t.dir, t.slug);
+  assert.deepStrictEqual(after.gate_cleared, []);
+  const text = cli.renderHandoff({ ledger: after });
+  assert.match(text, fixedOutsideLine(t.fix));
+  assert.doesNotMatch(text, /cleared at restart/);
+});
+
+test('a finding fixed in a prior run and cleared at a restart now is reported once, as cleared (#293)', () => {
+  const ledger = { ...review.emptyLedger({ kind: 'local', ref: 'feat/x' }), runs: [{ run: 1, status: 'clean', rounds: 1, fixed: [{ ...BLOCKING_GATE('gate:silent-gap:x'), fix_commit: 'abc1234' }], parked: [], killed: [] }], gate_cleared: [{ ...BLOCKING_GATE('gate:silent-gap:x'), clearedAt: '2026-10-09T00:00:00.000Z' }] };
+  const text = cli.renderHandoff({ ledger });
+  assert.doesNotMatch(text, /fixed in prior run #1: \[gate:silent-gap:x\]/);
+  assert.match(text, /cleared at restart/);
+});
+
+test('record-fix refuses a commit earlier than the reviewed head (#293)', () => {
+  const t = recordFixRepo({ ledger: gatePending });
+  const ledger = review.readLedger(t.dir, t.slug);
+  review.writeLedger(t.dir, t.slug, { ...ledger, target: { ...ledger.target, head_sha: t.fix } });
+  assertRefused(t, recordFixArgs(t.reviewed), /does not follow the reviewed head/);
+});
+
+test('record-fix refuses a dismissed gate finding and a clean ledger (#293)', () => {
+  const dismissed = { ...BLOCKING_GATE('gate:silent-gap:x'), dismissedBy: 'user' };
+  const t = recordFixRepo({ ledger: () => ({ status: 'gate-pending', gate_open: [BLOCKING_GATE('gate:silent-gap:y')], gate_dismissed: [dismissed] }) });
+  assertRefused(t, recordFixArgs(t.fix), /not a parked finding or a blocking gate finding/);
+  const c = recordFixRepo({ ledger: () => ({ status: 'clean', gate_open: [BLOCKING_GATE('gate:silent-gap:x')] }) });
+  assertRefused(c, recordFixArgs(c.fix), /the ledger is "clean"; only a stopped run/);
+});
+
+test('record-fix on a parked finding of a gate-pending run with a blocking gate finding keeps the stop and the gate finding (#293)', () => {
+  const t = recordFixRepo({ ledger: () => ({ status: 'gate-pending', findings: [PARKED_P], gate_open: [BLOCKING_GATE('gate:silent-gap:x')] }) });
+  recordFixP(t);
+  const after = review.readLedger(t.dir, t.slug);
+  assert.deepStrictEqual([after.status, after.findings[0].status, after.gate_open.map((f) => f.id)], ['gate-pending', 'fixed', ['gate:silent-gap:x']]);
 });
 
 test('round-start refuses before any reservation when a DoD interpreter is missing from the reviewer environment', () => {
@@ -6401,6 +6526,27 @@ test('#308 control: an open git finding that no unpark reopened stays open when 
   assert.strictEqual(review.readLedger(dir, slug).findings.find((f) => f.id === UNPARKED.id).status, 'open');
 });
 
+test('artifact-repair-dispatch refuses a descriptor whose candidate path or snapshot hash was edited (#329)', () => {
+  const repo = initRepo(); const dir = tmpDir();
+  const env = { ...process.env, REVIEW_STATE_DIR: dir, REVIEW_REPO_ROOT: repo };
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'two\n'); execFileSync('git', ['commit', '-aqm', 'change'], { cwd: repo });
+  const n = JSON.parse(run(['round-start', 'feat/kept', 'HEAD~1', '--broad'], { env, broadDefault: true })).round;
+  fs.writeFileSync(path.join(dir, `round-${n}-gate-verify.json`), JSON.stringify({ status: 'ok', rejected: [{ id: 'gate:cross-context:a', reason: 'ran it' }], findings: [{ id: 'gate:silent-gap:kept', rationale: 'kept' }] }));
+  const { repair } = JSON.parse(run(['artifact-normalize', 'feat/kept', 'gate-verify'], { env, broadDefault: true }));
+  // a relative REVIEW_STATE_DIR names the same state directory
+  const relEnv = { ...env, REVIEW_STATE_DIR: path.relative(process.cwd(), dir) };
+  assert.strictEqual(JSON.parse(run(['artifact-repair-dispatch', 'feat/kept', 'gate-verify'], { env: relEnv, broadDefault: true })).state, 'dispatched');
+  fs.writeFileSync(path.join(dir, `round-${n}-gate-verify.repair.json`), JSON.stringify(repair));
+  fs.rmSync(repair.candidatePath);
+  const descriptor = path.join(dir, `round-${n}-gate-verify.repair.json`);
+  const outside = path.join(tmpDir(), 'elsewhere.json');
+  for (const edit of [{ candidatePath: outside }, { originalHash: '0'.repeat(64) }]) {
+    fs.writeFileSync(descriptor, JSON.stringify({ ...repair, ...edit }));
+    assert.throws(() => run(['artifact-repair-dispatch', 'feat/kept', 'gate-verify'], { env, broadDefault: true }), /repair binding changed/);
+    assert.ok(!fs.existsSync(outside) && !fs.existsSync(repair.candidatePath));
+  }
+});
+
 test('artifact-normalize repairs a gate-verify artifact that lists a kept candidate in findings by dropping only that entry (#314)', () => {
   const repo = initRepo(); const dir = tmpDir();
   const env = { ...process.env, REVIEW_STATE_DIR: dir, REVIEW_REPO_ROOT: repo };
@@ -6423,4 +6569,26 @@ test('artifact-normalize repairs a gate-verify artifact that lists a kept candid
   const done = JSON.parse(run(['artifact-repair-candidate', 'feat/kept', 'gate-verify'], { env, broadDefault: true }));
   assert.strictEqual(JSON.parse(run(['artifact-normalize', 'feat/kept', 'gate-verify', '--candidate', done.candidatePath], { env, broadDefault: true })).status, 'ok');
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { status: 'ok', rejected, findings: [] });
+});
+
+test('unexaminedPaths resolves every changed path with one git call and keeps its result (#286)', { skip: process.platform === 'win32' }, () => {
+  const repo = initRepo();
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'same\n');
+  fs.writeFileSync(path.join(repo, 'b.txt'), 'same\n');
+  fs.writeFileSync(path.join(repo, 'c.txt'), 'other\n');
+  execFileSync('git', ['add', '-A'], { cwd: repo });
+  execFileSync('git', ['commit', '-qm', 'files'], { cwd: repo });
+  const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+  const log = path.join(tmpDir(), 'git.log');
+  const bin = tmpDir();
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  fs.writeFileSync(path.join(bin, 'git'), `#!/bin/sh\necho "$1" >> '${log}'\nexec '${realGit}' "$@"\n`, { mode: 0o755 });
+  const pathBefore = process.env.PATH;
+  process.env.PATH = `${bin}${path.delimiter}${pathBefore}`;
+  try {
+    // b.txt shares a blob with the examined a.txt; c.txt differs; gone.txt is absent at head.
+    const missing = cli.unexaminedPaths(repo, { target: { head_sha: head } }, ['a.txt', 'b.txt', 'c.txt', 'gone.txt'], ['a.txt']);
+    assert.deepStrictEqual(missing, ['c.txt', 'gone.txt']);
+  } finally { process.env.PATH = pathBefore; }
+  assert.strictEqual(fs.readFileSync(log, 'utf8').trim().split('\n').length, 1);
 });
