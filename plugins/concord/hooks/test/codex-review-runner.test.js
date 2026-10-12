@@ -1708,9 +1708,9 @@ test('file-target fix prompt still uses an explicitly classified group', () => {
   assert.match(prompt, /"files":\["<every edited path>"\]/);
 });
 
-test('correctness prompt requires every changed file in examined', () => {
+test('correctness prompt requires every changed path, rename sources and deleted files included, in examined', () => {
   const prompt = reviewerPrompt('correctness', { stateDir: '/state', round: 7, targetType: 'git', dodPassed: true });
-  assert.match(prompt, /every changed file.*examined/i);
+  assert.match(prompt, /every changed path.*examined.*old path of every renamed file and every deleted file/i);
 });
 
 test('correctness prompt never claims the DoD passed when the gate was deferred', () => {
@@ -3397,4 +3397,63 @@ test('a non-Codex reviewer under the Codex driver has a gate-verify kept candida
   const result = await runReviewUntilGreen({ ref: 'feature/x', base: 'HEAD~1', repoRoot: repo, reviewStateDir: stateDir, cliPath: path.join(__dirname, '..', 'review-cli.js'), spawn, reviewer: 'claude', noDod: true, broad: true, reviewOnly: true });
   assert.deepStrictEqual(spawned, ['correctness', 'gate', 'verify', 'gate-verify'], 'the repair is built by the CLI, so each reviewer role launches once and nothing else');
   assert.deepStrictEqual(result.findings.map((f) => f.id), ['gate:silent-gap:kept'], 'the kept candidate survives the repair');
+});
+
+test('a correctness coverage miss relaunches the reviewer once with the missing paths; a second miss is terminal', async () => {
+  for (const secondMiss of [false, true]) {
+    const stateDir = temp();
+    const prompts = [];
+    let normalizes = 0;
+    const coverageError = (tail) => new Error(`harness-failure: correctness coverage is incomplete; missing changed file(s): b.txt; ${tail}`);
+    const options = { ref: `feature/coverage-${secondMiss}`, base: 'main', repoRoot: '/repo', initiativeRunKey: `coverage-${secondMiss}`, initiativeStateDir: stateDir, initiativeMaxLaunches: 8, initiativeMaxRounds: 2,
+      runCli: ([verb, , arg]) => {
+        if (verb === 'reserve') return { status: 'granted' };
+        if (verb === 'round-start') return { decision: 'work', round: 1, base: 'main', head: 'head', stateDir, targetType: 'git', dodPassed: true, dodDeferred: false, intentApplied: false, gateApplied: false };
+        if (verb === 'artifact-normalize') {
+          if (++normalizes === 1) throw coverageError('resume the same round to re-run the correctness reviewer once');
+          if (secondMiss) throw coverageError('correctness coverage retry exhausted for this round');
+          return { status: 'ok' };
+        }
+        if (verb === 'show') return { round: 1, execution: { coverageRetry: { state: normalizes === 1 ? 'pending' : 'exhausted' }, retryArtifacts: { correctness: 'RETRY-NAMES-b.txt' } } };
+        if (verb === 'round-failure') return { status: 'recorded' };
+      },
+      spawn: async (input) => { prompts.push(String(input.prompt || input.args || '')); return { status: 0 }; } };
+    await assert.rejects(runReviewUntilGreen(options), (error) => secondMiss ? /retry exhausted/.test(error.message) : true);
+    assert.ok(normalizes >= 2, 'the coverage miss must trigger a second correctness launch and normalize');
+    const correctness = prompts.filter((p) => p.startsWith('Review the diff and surrounding code'));
+    assert.strictEqual(correctness.length, 2, 'the correctness reviewer launches exactly twice');
+    assert.ok(!correctness[0].includes('RETRY-NAMES-b.txt'), 'the first launch carries no retry names');
+    assert.ok(correctness[1].includes('RETRY-NAMES-b.txt'), 'the relaunch carries the missing paths');
+  }
+});
+
+test('reviewOnly: the coverage re-run survives the CLI rewriting the protected ledger', async () => {
+  const repo = cleanRepo();
+  const stateDir = temp();
+  const h = harness({ stateDir });
+  const review = require('../../core/review');
+  const slug = review.targetSlug('feature/coverage-protected');
+  let normalizes = 0;
+  const cli = (args) => {
+    if (args[0] === 'findings') return { findings: [] };
+    if (args[0] === 'show') return { round: 1, execution: { coverageRetry: { state: 'pending' }, retryArtifacts: { correctness: 'RETRY-NAMES-b.txt' } } };
+    if (args[0] === 'artifact-normalize' && args[2] === 'correctness' && ++normalizes === 1) {
+      fs.writeFileSync(review.ledgerPath(stateDir, slug), '{"coverageRetry":"pending"}\n');
+      throw new Error('harness-failure: correctness coverage is incomplete; missing changed file(s): b.txt; resume the same round to re-run the correctness reviewer once');
+    }
+    const result = h.cli(args);
+    if (args[0] === 'round-start') {
+      fs.writeFileSync(path.join(stateDir, 'round-1-diff.txt'), 'original diff\n');
+      fs.writeFileSync(path.join(stateDir, 'round-1-changes.json'), '{"paths":[]}\n');
+      fs.writeFileSync(path.join(stateDir, 'round-1-history.json'), '{}\n');
+      fs.writeFileSync(review.ledgerPath(stateDir, slug), '{}\n');
+    }
+    return result;
+  };
+  try {
+    await runReviewUntilGreen({ ref: 'feature/coverage-protected', base: 'main', repoRoot: repo, runCli: cli, spawn: h.spawn, reviewOnly: true, reviewer: 'claude', noBroad: true });
+  } catch (error) {
+    assert.doesNotMatch(error.message, /protected review artifact changed/);
+  }
+  assert.ok(normalizes >= 2, 'the re-run must reach its second normalize');
 });
