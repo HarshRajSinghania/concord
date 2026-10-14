@@ -12,7 +12,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { safeIdForFilename } = require('./artifact-name');
 const { writeFileAtomic } = require('./atomic-write');
-const { captureArtifactRoot, hashArtifact, readArtifactBytes } = require('./bounded-artifact');
+const { captureArtifactRoot, hashArtifact, readArtifactBytes, readArtifactJson } = require('./bounded-artifact');
 const { targetSlug, ledgerPath } = require('./review');
 const { SESSION_MODES, THRESHOLDS } = require('./session-handoff');
 const { artifactDestinationFromPrompt } = require('./review-artifact');
@@ -276,10 +276,8 @@ function codexExec({ role, prompt, repoRoot, stateDir, cliPath, requestedModel, 
 
 // A string array field of a reviewer artifact, or [] when the artifact or field is absent.
 function artifactList(file, field) {
-  try {
-    const value = JSON.parse(fs.readFileSync(file, 'utf8'))[field];
-    return Array.isArray(value) ? value.filter((item) => typeof item === 'string') : [];
-  } catch (_) { return []; }
+  const value = readArtifactJson(file)?.[field];
+  return Array.isArray(value) ? value.filter((item) => typeof item === 'string') : [];
 }
 
 function declaredFixFiles(context, groups) {
@@ -774,8 +772,9 @@ async function runRounds(options) {
       if (lensFailure) throw lensFailure.reason;
       const candidates = [];
       for (const lens of lenses) {
+        // A missing or malformed lens artifact is lenient; an unsafe or oversized one is a harness failure.
+        const raw = readArtifactJson(path.join(context.stateDir, `round-${context.round}-gate-panel-${panel.round}-${lens}.json`));
         try {
-          const raw = JSON.parse(fs.readFileSync(path.join(context.stateDir, `round-${context.round}-gate-panel-${panel.round}-${lens}.json`), 'utf8'));
           for (const finding of raw.findings || []) {
             // Candidate IDs are interpolated into verdict artifact names below.
             // Panel output is advisory and lenient, so an invalid candidate is
@@ -798,7 +797,7 @@ async function runRounds(options) {
           // assigned -- tallying that as a refutation is the false clean the
           // field exists to prevent, so it fails the round like every other
           // panel read path (review-cli.js requireNotBlocked).
-          try { raw = JSON.parse(fs.readFileSync(verdict, 'utf8')); } catch (_) { return false; }
+          raw = readArtifactJson(verdict);
           const blocked = raw ? raw.blocked : undefined;
           if (blocked !== undefined && !(Array.isArray(blocked) && !blocked.length)) {
             const detail = Array.isArray(blocked) ? blocked.map((b) => String(b)).join('; ') : String(blocked);
@@ -834,9 +833,10 @@ async function runRounds(options) {
     const authoritativeSources = [...new Set(sourcePaths)].filter(source => fs.existsSync(source)).map(source => ({ path: canonicalPath(source), sha256: crypto.createHash('sha256').update(fs.readFileSync(source)).digest('hex') }));
     const nextArgs = result.decision?.continue ? ['round-start', ref, ...(initialBase ? [initialBase] : []), ...(broad ? ['--broad'] : []), ...(noBroad ? ['--no-broad'] : []), ...(noDod ? ['--no-dod'] : []), ...(options.intentFile ? ['--intent-file', options.intentFile] : [])] : ['show', ref];
     const nextStep = { executable: process.execPath, cliPath: path.resolve(publicCliPath), args: [...nextArgs, ...initiativeFlags] };
+    const artifactRoot = captureArtifactRoot(started.stateDir);
     const completedArtifacts = fs.readdirSync(started.stateDir).filter(name => new RegExp(`^round-${started.round}-.*\\.json$`).test(name)).map(name => {
       const artifactPath = path.join(started.stateDir, name);
-      return { path: artifactPath, sha256: crypto.createHash('sha256').update(fs.readFileSync(artifactPath)).digest('hex') };
+      return { path: artifactPath, sha256: hashArtifact(artifactPath, artifactRoot) };
     });
     const stem = path.join(started.stateDir, `session-review-${targetSlug(ref)}`);
     const statePath = `${stem}-state.json`, handoffPath = `${stem}-handoff.json`, packetPath = `${stem}-packet.json`;
