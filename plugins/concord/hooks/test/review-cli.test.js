@@ -3136,6 +3136,42 @@ test('round-start: resume rejects a routing change', () => {
   );
 });
 
+test('round-start: reviewer guidance is persisted, restored on resume, and never parsed as base', () => {
+  const repo = initRepo();
+  const dir = tmpDir();
+  const env = { ...process.env, REVIEW_STATE_DIR: dir, REVIEW_REPO_ROOT: repo };
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'two\n');
+  execFileSync('git', ['commit', '-aqm', 'change'], { cwd: repo });
+  const guidance = 'UI only, skip the backend, focus on accessibility';
+  const first = JSON.parse(run(['round-start', 'feat/x', 'HEAD~1', '--reviewer-guidance', guidance], { env }));
+  assert.strictEqual(first.base, 'HEAD~1');
+  assert.strictEqual(first.reviewerGuidance, guidance);
+  assert.strictEqual(review.readLedger(dir, review.targetSlug('feat/x')).reviewerGuidance, guidance);
+  const resumed = JSON.parse(run(['round-start', 'feat/x'], { env }));
+  assert.strictEqual(resumed.reviewerGuidance, guidance);
+  assert.throws(() => run(['round-start', 'feat/x', '--reviewer-guidance', 'backend only'], { env }), /guidance is fixed when a run starts/);
+});
+
+test('round-start: flag-looking reviewer guidance is literal text, not an option', () => {
+  const repo = initRepo();
+  const dir = tmpDir();
+  const env = { ...process.env, REVIEW_STATE_DIR: dir, REVIEW_REPO_ROOT: repo };
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'two\n');
+  execFileSync('git', ['commit', '-aqm', 'change'], { cwd: repo });
+  const first = JSON.parse(run(['round-start', 'feat/x', 'HEAD~1', '--reviewer-guidance', '--no-dod'], { env }));
+  assert.strictEqual(first.reviewerGuidance, '--no-dod');
+  assert.strictEqual(first.dodDeferred, false);
+});
+
+test('renderHandoff retains current and archived reviewer guidance', () => {
+  const ledger = review.emptyLedger({ kind: 'local', ref: 'feat/x' });
+  ledger.reviewerGuidance = 'focus accessibility';
+  ledger.runs = [{ run: 1, engine: 'codex', status: 'clean', rounds: 1, reviewerGuidance: 'focus parsing' }];
+  const handoff = cli.renderHandoff({ ledger });
+  assert.match(handoff, /reviewer guidance: "focus accessibility"/);
+  assert.match(handoff, /prior run #1.*guidance "focus parsing"/);
+});
+
 test('round-start: a mid-round resume keeps gateApplied true for the round that already fired', () => {
   const repo = initRepo();
   const dir = tmpDir();
@@ -4166,6 +4202,51 @@ test('rerun does not reuse an interrupted front pass', () => {
 
   const restarted = JSON.parse(run(['round-start', ref], { env, broadDefault: true }));
   assert.strictEqual(restarted.gateApplied, true, 'a gate launch without a recorded round is not reusable evidence');
+});
+
+test('rerun accepts guidance for its fresh run and does not reuse an unrestricted front pass', () => {
+  const repo = initRepo(); const dir = tmpDir(); const ref = 'feat/guided-rerun';
+  const env = { ...process.env, REVIEW_STATE_DIR: dir, REVIEW_REPO_ROOT: repo };
+  const base = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'two\n');
+  execFileSync('git', ['commit', '-aqm', 'change'], { cwd: repo });
+
+  const first = JSON.parse(run(['round-start', ref, base], { env, broadDefault: true }));
+  writeArtifact(dir, first.round, 'correctness', { status: 'ok', examined: ['a.txt'], findings: [] });
+  writeArtifact(dir, first.round, 'gate', { status: 'ok', findings: [] });
+  writeArtifact(dir, first.round, 'verify', { status: 'ok', rejected: [] });
+  writeArtifact(dir, first.round, 'gate-verify', { status: 'ok', rejected: [] });
+  run(['plan-fixes', ref], { env });
+  assert.strictEqual(JSON.parse(run(['record', ref], { env })).decision.converged, true);
+
+  run(['rerun', ref], { env });
+  const guidance = 'focus accessibility';
+  const restarted = JSON.parse(run(['round-start', ref, '--reviewer-guidance', guidance], { env, broadDefault: true }));
+  assert.strictEqual(restarted.reviewerGuidance, guidance);
+  assert.strictEqual(restarted.gateApplied, true, 'new guidance must invalidate an unrestricted prior front pass');
+});
+
+test('rerun preserves guided front-pass provenance and never reuses it as unrestricted review', () => {
+  const repo = initRepo(); const dir = tmpDir(); const ref = 'feat/prior-guided-rerun';
+  const env = { ...process.env, REVIEW_STATE_DIR: dir, REVIEW_REPO_ROOT: repo };
+  const base = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'two\n');
+  execFileSync('git', ['commit', '-aqm', 'change'], { cwd: repo });
+
+  const guidance = 'focus accessibility';
+  const first = JSON.parse(run(['round-start', ref, base, '--reviewer-guidance', guidance], { env, broadDefault: true }));
+  writeArtifact(dir, first.round, 'correctness', { status: 'ok', examined: ['a.txt'], findings: [] });
+  writeArtifact(dir, first.round, 'gate', { status: 'ok', findings: [] });
+  writeArtifact(dir, first.round, 'verify', { status: 'ok', rejected: [] });
+  writeArtifact(dir, first.round, 'gate-verify', { status: 'ok', rejected: [] });
+  run(['plan-fixes', ref], { env });
+  assert.strictEqual(JSON.parse(run(['record', ref], { env })).decision.converged, true);
+
+  run(['rerun', ref], { env });
+  const archived = review.readLedger(dir, review.targetSlug(ref)).broad_reuse;
+  assert.strictEqual(archived.reviewerGuidance, guidance);
+  const restarted = JSON.parse(run(['round-start', ref], { env, broadDefault: true }));
+  assert.strictEqual(restarted.gateApplied, true, 'a guided prior front pass cannot stand in for unrestricted review');
 });
 
 test('rerun invalidates broad reuse when intent is newly configured', () => {
