@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -17,10 +18,28 @@ export const VERSION_FILES = [
   '.github/plugin/marketplace.json',
 ];
 
-export function nextBeta(version) {
-  const match = /^(\d+\.\d+\.\d+-beta\.)(0|[1-9]\d*)$/.exec(version);
-  if (!match) throw new Error(`Version ${JSON.stringify(version)} has no numeric trailing beta identifier`);
-  return `${match[1]}${Number(match[2]) + 1}`;
+const NUM = '(0|[1-9]\\d*)';
+const STABLE = new RegExp(`^${NUM}\\.${NUM}\\.${NUM}$`);
+const BETA = new RegExp(`^${NUM}\\.${NUM}\\.${NUM}-beta\\.${NUM}$`);
+
+// A stable release goes to the next minor's first beta; a beta goes to its next number.
+export function nextVersion(version) {
+  const stable = STABLE.exec(version);
+  if (stable) return `${stable[1]}.${Number(stable[2]) + 1}.0-beta.1`;
+  const beta = BETA.exec(version);
+  if (beta) return `${beta[1]}.${beta[2]}.${beta[3]}-beta.${Number(beta[4]) + 1}`;
+  throw new Error(`Version ${JSON.stringify(version)} is neither a stable X.Y.Z nor an X.Y.Z-beta.N version`);
+}
+
+// True when `head` is a stable version with higher SemVer precedence than `base`; a prerelease of X.Y.Z ranks below X.Y.Z.
+export function isStableUpgrade(base, head) {
+  const to = STABLE.exec(head);
+  const from = /^(\d+)\.(\d+)\.(\d+)(-.*)?$/.exec(base);
+  if (!to || !from) return false;
+  for (let i = 1; i <= 3; i += 1) {
+    if (Number(to[i]) !== Number(from[i])) return Number(to[i]) > Number(from[i]);
+  }
+  return Boolean(from[4]);
 }
 
 export function touchedVersionFiles(paths) {
@@ -33,32 +52,72 @@ function git(...args) {
   return execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
 
+// The release is exactly what the base's release script writes for the head version: no other manifest field changes and all five files agree.
+function matchesReleaseScript(baseRef, headRef, version) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'release-guard-'));
+  try {
+    for (const file of VERSION_FILES) {
+      fs.mkdirSync(path.dirname(path.join(tmp, file)), { recursive: true });
+      fs.writeFileSync(path.join(tmp, file), execFileSync('git', ['show', `${baseRef}:${file}`], { cwd: root, encoding: 'utf8' }));
+    }
+    execFileSync(process.execPath, [path.join(root, 'scripts/release-version.mjs'), version], { cwd: root, env: { ...process.env, CONCORD_VERSION_ROOT: tmp }, stdio: 'ignore' });
+    return VERSION_FILES.every((file) => fs.readFileSync(path.join(tmp, file), 'utf8') === execFileSync('git', ['show', `${headRef}:${file}`], { cwd: root, encoding: 'utf8' }));
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 function guard(baseRef, headRef) {
   const changed = git('diff', '--name-only', `${baseRef}...${headRef}`).split('\n').filter(Boolean);
   const touched = touchedVersionFiles(changed);
   if (touched.length === 0) return 0;
-  console.error(`Pull requests do not edit version files; main's release-bump workflow raises the version after merge:\n${touched.join('\n')}`);
+  // The one pull request allowed to edit version files is a release: only version files change, and VERSION becomes a higher stable version.
+  // The head is read as data with git show; its scripts never run.
+  if (touched.length === changed.length && touched.includes('VERSION')) {
+    try {
+      const base = git('show', `${baseRef}:VERSION`).trim();
+      const head = git('show', `${headRef}:VERSION`).trim();
+      if (isStableUpgrade(base, head) && matchesReleaseScript(baseRef, headRef, head)) return 0;
+    } catch {
+      // A missing VERSION or an unrunnable release script is not a release; fall through to the failure.
+    }
+  }
+  console.error(`Pull requests do not edit version files except a release that sets a higher stable VERSION; main's release-bump workflow raises the version after merge:\n${touched.join('\n')}`);
   return 1;
 }
 
 const BUMP_SUBJECT = 'chore(release): bump Concord to ';
 
-// Every non-bot first-parent commit after the newest release bump is a merge that still needs its bump:
+// Every non-bot first-parent commit after the newest release bump or stable release is a merge that still needs its bump:
 // a bump push lands on the tip its run fetched and carries every merge before it.
+// A stable release commit is recognized by its content, a stable VERSION that differs from its first parent's, because a squash merge title is not fixed.
 // Other commits by the Actions bot are neither a boundary nor a merge.
+function isStableRelease(sha) {
+  try {
+    const version = git('show', `${sha}:VERSION`).trim();
+    return STABLE.test(version) && version !== git('show', `${sha}^:VERSION`).trim();
+  } catch {
+    return false; // no parent, or no VERSION file
+  }
+}
+
 function pendingMerges(branch) {
-  const commits = git('log', '--first-parent', '--format=%ae%x09%s', `origin/${branch}`).split('\n').filter(Boolean);
+  const commits = git('log', '--first-parent', '--format=%H%x09%ae%x09%s', `origin/${branch}`).split('\n').filter(Boolean);
   let pending = 0;
   for (const commit of commits) {
-    const [author, subject] = commit.split('\t');
-    if (author === BOT_EMAIL && subject.startsWith(BUMP_SUBJECT)) break;
-    if (author !== BOT_EMAIL) pending += 1;
+    const [sha, author, subject] = commit.split('\t');
+    if (author === BOT_EMAIL) {
+      if (subject.startsWith(BUMP_SUBJECT)) break;
+    } else {
+      if (isStableRelease(sha)) break;
+      pending += 1;
+    }
   }
   return pending;
 }
 
 function commitBump() {
-  const next = nextBeta(fs.readFileSync(path.join(root, 'VERSION'), 'utf8').trim());
+  const next = nextVersion(fs.readFileSync(path.join(root, 'VERSION'), 'utf8').trim());
   execFileSync(process.execPath, [path.join(root, 'scripts/release-version.mjs'), next], { cwd: root, stdio: 'inherit' });
   git('add', '--', ...VERSION_FILES);
   git('-c', `user.name=${BOT_NAME}`, '-c', `user.email=${BOT_EMAIL}`, 'commit', '-q', '--no-verify',
