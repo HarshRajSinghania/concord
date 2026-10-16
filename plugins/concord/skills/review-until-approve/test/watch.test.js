@@ -60,3 +60,69 @@ test('watch: ten failed polls end with an error event and exit status 1', () => 
   assert.equal(out[0].event, 'error');
   assert.equal(code, 1);
 });
+
+function runIn(dir, extraArgs) {
+  const r = spawnSync('node', [WATCH, path.join(dir, 'ledger.json'), 'o/r', '5', '--interval', '0.01', ...extraArgs], { encoding: 'utf8', env: { ...process.env, PATH: `${dir}${path.delimiter}${process.env.PATH}` }, timeout: 20000 });
+  return { out: r.stdout.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)), code: r.status };
+}
+
+test('watch: --max-wait ends a silent wait with an idle event and exit status 0', () => {
+  const dir = setup([{ head: 'h1' }], ledger);
+  const { out, code } = runIn(dir, ['--max-wait', '0.2']);
+  assert.deepEqual(out, [{ event: 'idle' }]);
+  assert.equal(code, 0);
+});
+
+test('watch: a nudge is not repeated by the next bounded run, with or without the session recording it', () => {
+  const old = { ...ledger, rounds: [{ ...ledger.rounds[0], submittedAt: new Date(Date.now() - 25 * 3600 * 1000).toISOString() }] };
+  const dir = setup([{ head: 'h2' }], old);
+  assert.deepEqual(runIn(dir, ['--max-wait', '5']).out, [{ event: 'nudge', kind: 'push-only', head: 'h2', replyAt: null }]);
+  assert.deepEqual(runIn(dir, ['--max-wait', '0.2']).out, [{ event: 'idle' }]);
+});
+
+test('watch: the head seen by one bounded run counts toward the next run\'s two-poll stability', () => {
+  const dir = setup([{ head: 'h2', pulls: [reply()] }], ledger);
+  fs.writeFileSync(path.join(dir, 'ledger.json.watch.json'), JSON.stringify({ previousHead: 'h2' }));
+  assert.deepEqual(runIn(dir, ['--max-wait', '5']).out, [{ event: 'round', head: 'h2' }]);
+  const fresh = setup([{ head: 'h2', pulls: [reply()] }], ledger);
+  assert.deepEqual(runIn(fresh, ['--max-wait', '0.01']).out, [{ event: 'idle' }]);
+});
+
+test('watch: a nudge in the ledger does not hide a later nudge the sidecar already showed', () => {
+  const old = { ...ledger, nudged: { kind: 'push-only', head: 'h0', replyAt: null }, rounds: [{ ...ledger.rounds[0], submittedAt: new Date(Date.now() - 25 * 3600 * 1000).toISOString() }] };
+  const dir = setup([{ head: 'h2' }], old);
+  assert.equal(runIn(dir, ['--max-wait', '5']).out[0].event, 'nudge');
+  assert.deepEqual(runIn(dir, ['--max-wait', '0.2']).out, [{ event: 'idle' }]);
+});
+
+test('watch: --max-wait ends at the deadline, not at the end of the next poll interval', () => {
+  const dir = setup([{ head: 'h1' }], ledger);
+  const started = Date.now();
+  const r = spawnSync('node', [WATCH, path.join(dir, 'ledger.json'), 'o/r', '5', '--interval', '10', '--max-wait', '0.3'], { encoding: 'utf8', env: { ...process.env, PATH: `${dir}${path.delimiter}${process.env.PATH}` }, timeout: 20000 });
+  assert.deepEqual(JSON.parse(r.stdout), { event: 'idle' });
+  assert.ok(Date.now() - started < 5000, `took ${Date.now() - started} ms`);
+});
+
+test('watch: failed polls add up across bounded runs until the error event', () => {
+  const dir = setup([{ fail: true }], ledger);
+  for (let i = 1; i < 10; i++) assert.deepEqual(runIn(dir, ['--max-wait', '0.01']).out, [{ event: 'idle' }], `run ${i}`);
+  const last = runIn(dir, ['--max-wait', '0.01']);
+  assert.equal(last.out[0].event, 'error');
+  assert.equal(last.code, 1);
+});
+
+test('watch: a run started after an error event does not error on its first failed poll', () => {
+  const dir = setup([{ fail: true }], ledger);
+  for (let i = 1; i < 10; i++) runIn(dir, ['--max-wait', '0.01']);
+  assert.equal(runIn(dir, ['--max-wait', '0.01']).out[0].event, 'error');
+  assert.deepEqual(runIn(dir, ['--max-wait', '0.01']).out, [{ event: 'idle' }]);
+});
+
+test('watch: a non-numeric or non-positive --max-wait or --interval is refused with exit status 2', () => {
+  const dir = setup([{ head: 'h1' }], ledger);
+  for (const args of [['--max-wait', 'soon'], ['--max-wait', '0'], ['--max-wait'], ['--interval', 'x']]) {
+    const r = spawnSync('node', [WATCH, path.join(dir, 'ledger.json'), 'o/r', '5', ...args], { encoding: 'utf8', env: { ...process.env, PATH: `${dir}${path.delimiter}${process.env.PATH}` }, timeout: 5000 });
+    assert.equal(r.status, 2, args.join(' '));
+    assert.match(r.stderr, /usage/);
+  }
+});
