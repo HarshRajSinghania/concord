@@ -43,17 +43,56 @@ test('isPublished: a reused id in the same file is the same finding, and a fixed
   assert.equal(lib.isPublished(l, finding('c:3', 'z.js', 'baz')), true);
 });
 
-test('classifyPrior: raised again or untouched with the span still present stays open, otherwise fixed', () => {
-  const open = [
-    { ...finding('raised', 'a.js', 'one'), status: 'open' },
-    { ...finding('untouched', 'b.js', 'two'), status: 'open' },
-    { ...finding('touched', 'c.js', 'three'), status: 'open' },
-    { ...finding('gone', 'd.js', 'four'), status: 'open' },
-  ];
-  const raised = [finding('raised', 'a.js', 'one')];
-  const changed = new Set(['a.js', 'c.js']);
-  const spanAtHead = (file, span) => file === 'b.js' || file === 'c.js' ? true : false;
-  assert.deepEqual(lib.classifyPrior(open, raised, changed, spanAtHead), { open: ['raised', 'untouched'], fixed: ['touched', 'gone'] });
+// An open ledger finding whose span was verified verbatim at head h1.
+const held = (id, file, span, extra = {}) => { const f = finding(id, file, span, extra); return { ...f, key: lib.findingKey(f), status: 'open', spanVerified: 'h1', ...extra }; };
+const files = (table) => (p) => p in table ? table[p] : null;
+const same = () => ({ renames: new Map(), live: new Set() });
+const verdictOf = (v) => v.map((r) => [r.id, r.status, r.reason]);
+
+test('classifyPrior: a verified finding is fixed only when its span is gone from its path and from every file the push left in place', () => {
+  const open = [held('here', 'a.js', 'one'), held('gone', 'b.js', 'two'), held('moved', 'c.js', 'three')];
+  const read = files({ 'a.js': Buffer.from('one'), 'b.js': Buffer.from('other'), 'c.js': Buffer.from('x'), 'd.js': Buffer.from('three') });
+  const v = lib.classifyPrior(open, [], () => ({ renames: new Map(), live: new Set(['d.js']) }), read, 'h2');
+  assert.deepEqual(verdictOf(v), [['here', 'open', 'span-present'], ['gone', 'fixed', undefined], ['moved', 'open', 'span-present']]);
+  assert.deepEqual([v[0].spanVerified, v[2].file], ['h2', 'd.js']);
+});
+
+test('classifyPrior: a finding whose span was never verified stays open whatever the code says', () => {
+  const open = [{ ...held('a', 'a.js', 'one'), spanVerified: undefined }, held('empty', 'a.js', '', { span: '' })];
+  const v = lib.classifyPrior(open, [], same, files({ 'a.js': Buffer.from('nothing') }), 'h2');
+  assert.deepEqual(verdictOf(v), [['a', 'open', 'unverified'], ['empty', 'open', 'unverified']]);
+});
+
+test('classifyPrior: the reviewer re-raising a finding keeps it open, and its silence fixes nothing without the code changing', () => {
+  const open = [held('raised', 'a.js', 'one'), held('silent', 'b.js', 'two')];
+  const v = lib.classifyPrior(open, [finding('raised', 'a.js', 'one')], same, files({ 'a.js': Buffer.from('x'), 'b.js': Buffer.from('two') }), 'h2');
+  assert.deepEqual(verdictOf(v), [['raised', 'open', 'raised'], ['silent', 'open', 'span-present']]);
+});
+
+test('classifyPrior: raised again with the same id and file but a different span stays open', () => {
+  const open = [held('a', 'a.js', 'old span')];
+  const v = lib.classifyPrior(open, [finding('a', 'a.js', 'new span')], same, files({ 'a.js': Buffer.from('new span') }), 'h2');
+  assert.deepEqual(verdictOf(v), [['a', 'open', 'raised']]);
+});
+
+test('classifyPrior: no more than the twenty listed findings matters, every verified one is judged', () => {
+  const open = Array.from({ length: 25 }, (_, i) => held(`c${i}`, 'a.js', `s${i}`));
+  const v = lib.classifyPrior(open, [], same, files({ 'a.js': Buffer.from('rewritten') }), 'h2');
+  assert.equal(v.filter((r) => r.status === 'fixed').length, 25);
+});
+
+test('classifyPrior: a delta that cannot be computed, or a path that is no regular file, keeps the finding open', () => {
+  const open = [held('a', 'a.js', 'one'), held('b', 'b.js', 'two'), held('c', 'c.js', 'three')];
+  const v = lib.classifyPrior(open, [], (p) => p.id === 'a' ? null : same(), files({ 'b.js': 'other', 'c.js': 'big' }), 'h2');
+  assert.deepEqual(verdictOf(v), [['a', 'open', 'path-unresolved'], ['b', 'open', 'path-unresolved'], ['c', 'open', 'path-unresolved']]);
+});
+
+test('classifyPrior: a rename is followed, and a deleted file with the span nowhere is fixed', () => {
+  const open = [held('r', 'a.js', 'one'), held('d', 'b.js', 'two')];
+  const resolve = () => ({ renames: new Map([['a.js', 'a2.js']]), live: new Set(['a2.js']) });
+  const v = lib.classifyPrior(open, [], resolve, files({ 'a2.js': Buffer.from('one') }), 'h2');
+  assert.deepEqual(verdictOf(v), [['r', 'open', 'span-present'], ['d', 'fixed', undefined]]);
+  assert.equal(v[0].file, 'a2.js');
 });
 
 test('evaluateApproval: approves only a reviewed, open, non-draft head with no open blocking finding', () => {
@@ -115,4 +154,11 @@ test('repliesSince: compares instants, not strings, and tolerates a comment with
   const l = ledger({ rounds: [round(1, 'h1', { submittedAt: '2026-01-01T00:00:00.500Z' })] });
   const issue = [{ user: { login: 'dev' }, created_at: '2026-01-01T00:00:01Z' }, { user: { login: 'dev' }, created_at: '2026-01-01T00:00:00Z' }, { user: null, created_at: '2026-01-01T00:00:02Z' }];
   assert.deepEqual(lib.repliesSince(l, [], issue, 'dev'), ['2026-01-01T00:00:01Z']);
+});
+
+test('parseNameStatus: renames and the paths still present; a deletion is not present', () => {
+  const raw = ['R100', 'src/a.js', 'src/a2.js', 'R087', 'src/b.js', 'src/b2.js', 'M', 'src/c.js', 'D', 'src/d.js', 'A', 'src/e.js', ''].join('\0');
+  const { renames, live } = lib.parseNameStatus(raw);
+  assert.deepEqual([...renames], [['src/a.js', 'src/a2.js'], ['src/b.js', 'src/b2.js']]);
+  assert.deepEqual([...live].sort(), ['src/a2.js', 'src/b2.js', 'src/c.js', 'src/e.js']);
 });

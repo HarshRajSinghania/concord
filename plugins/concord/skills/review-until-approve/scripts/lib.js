@@ -35,15 +35,48 @@ function isPublished(ledger, f) {
   return matches(ledger.findings.filter((p) => p.status !== 'fixed'), f).length > 0;
 }
 
-// An earlier open finding stays open when this round raised it again, or when its
-// file is untouched and the span still occurs at the new head.
-function classifyPrior(open, raised, changedFiles, spanAtHead) {
-  const out = { open: [], fixed: [] };
-  for (const p of open) {
-    const again = raised.some((f) => matches(open, f).includes(p));
-    (again || (!changedFiles.has(p.file) && spanAtHead(p.file, p.span)) ? out.open : out.fixed).push(p.id);
+// The renames (old path -> new path) and the paths still present (everything but a deletion) of `git diff -z --name-status -M`.
+function parseNameStatus(raw) {
+  const t = raw.split('\0');
+  const renames = new Map(), live = new Set();
+  for (let i = 0; i + 1 < t.length; i += 2) {
+    if (/^[RC]/.test(t[i])) {
+      live.add(t[i + 2]);
+      if (t[i][0] === 'R') renames.set(t[i + 1], t[i + 2]);
+      i++;
+    } else if (t[i][0] !== 'D') live.add(t[i + 1]);
   }
-  return out;
+  return { renames, live };
+}
+
+// A finding is fixed only on evidence in git objects, never on the reviewer's silence. `resolve(p)` is the
+// name-status delta (`{ renames, live }`) from the head where the span was last verified to the new head,
+// or null when it cannot be computed. `read(path)` is the file at the new head: a Buffer, null when the path
+// is absent, 'other' when it is not a regular file, 'big' when it is too large to read. An open finding is
+// fixed when its span was verified verbatim earlier and no longer occurs at its path, following a rename,
+// nor in any other path the push left in place. Anything else stays open with a reason: `unverified` (no
+// verbatim span was ever recorded), `raised` (the reviewer raised it again), `path-unresolved`, `span-present`.
+// A span that occurs at the head moves the anchor (`file`, `spanVerified`) to the new head.
+function classifyPrior(open, raised, resolve, read, head) {
+  const ctx = open.map((p) => typeof p.spanVerified === 'string' && p.span ? resolve(p) : null);
+  const moved = open.map((p, i) => ({ ...p, file: ctx[i]?.renames.get(p.file) || p.file }));
+  return open.map((p, i) => {
+    const q = moved[i], keep = (reason, extra = {}) => ({ key: p.key, id: p.id, status: 'open', reason, ...extra });
+    if (typeof p.spanVerified !== 'string' || !p.span) return keep('unverified');
+    if (raised.some((f) => matches(moved, f).includes(q))) return keep('raised');
+    if (!ctx[i]) return keep('path-unresolved');
+    const span = Buffer.from(p.span, 'utf8');
+    const here = read(q.file);
+    if (here === 'other' || here === 'big') return keep('path-unresolved');
+    if (here && here.includes(span)) return keep('span-present', { file: q.file, spanVerified: head });
+    for (const other of ctx[i].live) {
+      if (other === q.file) continue;
+      const b = read(other);
+      if (b === 'big') return keep('path-unresolved');
+      if (Buffer.isBuffer(b) && b.includes(span)) return keep('span-present', { file: other, spanVerified: head });
+    }
+    return { key: p.key, id: p.id, status: 'fixed' };
+  });
 }
 
 // Every verified finding blocks: the review engine emits no severity. A user
@@ -89,4 +122,4 @@ function wakeDecision({ ledger, live, replies, now, stable }) {
   return { event: 'nudge', kind, head: live.head, replyAt };
 }
 
-module.exports = { chooseRange, findingKey, isPublished, classifyPrior, evaluateApproval, repliesSince, wakeDecision, sha, NUDGE_AFTER_MS, TIMEOUT_MS };
+module.exports = { chooseRange, findingKey, matches, isPublished, parseNameStatus, classifyPrior, evaluateApproval, repliesSince, wakeDecision, sha, NUDGE_AFTER_MS, TIMEOUT_MS };

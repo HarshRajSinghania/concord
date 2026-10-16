@@ -12,7 +12,7 @@ const { fileTarget } = require('../../core/target');
 
 // The runner owns all sequencing. Its subprocess seam makes this a no-network
 // integration test while exercising the real artifact contract at the boundary.
-const { runReviewUntilGreen, reviewerPrompt, codexExec, providerExec, resolveCodexExecutable, resolveDefaultBase } = require('../../core/codex-review-runner');
+const { runReviewUntilGreen, reviewCodexConfig, reviewerPrompt, codexExec, providerExec, resolveCodexExecutable, resolveDefaultBase } = require('../../core/codex-review-runner');
 const { reviewerPrompt: packagedReviewerPrompt } = require('../../../concord-codex/engine/codex-review-runner');
 const { tempDir } = require('./temp-dir');
 
@@ -3311,11 +3311,90 @@ test('reviewOnly runs a Codex reviewer from its own CODEX_HOME, which marks the 
     assert.ok(launch.config.includes('[permissions.concord-review]\nextends = ":workspace"'), launch.config);
     assert.ok(launch.config.includes(`[permissions.concord-review.filesystem]\n${JSON.stringify(path.join(sourceHome, 'auth.json'))} = "deny"`), launch.config);
     assert.ok(launch.config.includes(`${JSON.stringify(path.join(launch.home, 'auth.json'))} = "deny"`), launch.config);
+    assert.ok(launch.config.includes(`${JSON.stringify(path.join(fs.realpathSync(path.dirname(launch.home)), path.basename(launch.home)))} = "read"\n\n[permissions.concord-review.network]`), 'the CODEX_HOME is read-only inside the sandbox');
     assert.ok(launch.config.includes('[permissions.concord-review.network]\nenabled = false'), launch.config);
     assert.ok(!launch.config.includes('mcp_servers'), 'the account\'s own Codex configuration stays out');
     assert.strictEqual(launch.auth, '{"OPENAI_API_KEY":"sk-test"}');
   }
   assert.ok(!fs.existsSync(seen[0].home), 'the review-only CODEX_HOME is removed when the run ends');
+});
+
+test('a CODEX_HOME reached through a symlinked home is covered by the home entry and gets no nested deny', () => {
+  const real = fs.realpathSync(temp());
+  fs.mkdirSync(path.join(real, '.codex'));
+  const link = path.join(fs.realpathSync(temp()), 'home-link');
+  fs.symlinkSync(real, link);
+  const home = fs.realpathSync(temp());
+  const checkout = fs.realpathSync(temp());
+  const sourceAuth = path.join(link, '.codex', 'auth.json');
+  const config = reviewCodexConfig({ home, sourceAuth, checkout, denyRead: [], realHome: link });
+  assert.ok(config.includes(`${JSON.stringify(path.join(real, '.codex'))} = "deny"`), config);
+  assert.ok(!config.includes(JSON.stringify(sourceAuth)), 'the auth file inside a denied directory has no entry of its own');
+});
+
+// The review-only CODEX_HOME sits under /tmp, which the :workspace profile makes writable. A reviewer that could rewrite its config.toml
+// would lift the deny list for every later launch of the same run. Runs the real Codex sandbox, so it stands down where that cannot run.
+test('a command inside the review sandbox cannot rewrite the CODEX_HOME configuration, so a later launch is still denied', (t) => {
+  const probe = spawnSync('codex', ['sandbox', 'true'], { encoding: 'utf8' });
+  if (probe.error || probe.status !== 0) return t.skip('codex sandbox is not usable here');
+  const accountHome = fs.realpathSync(temp());
+  const decoy = path.join(accountHome, 'decoy.txt');
+  fs.writeFileSync(decoy, 'DECOY');
+  const home = fs.realpathSync(temp());
+  const checkout = fs.realpathSync(temp());
+  fs.writeFileSync(path.join(home, 'auth.json'), '{}');
+  const sourceAuth = path.join(accountHome, '.codex', 'auth.json');
+  const config = path.join(home, 'config.toml');
+  fs.writeFileSync(config, reviewCodexConfig({ home, sourceAuth, checkout, denyRead: [], realHome: accountHome }));
+  const before = fs.readFileSync(config, 'utf8');
+  const inSandbox = (command) => spawnSync('codex', ['sandbox', 'sh', '-c', command], { cwd: checkout, env: { ...process.env, CODEX_HOME: home }, encoding: 'utf8' });
+  assert.notStrictEqual(inSandbox(`cat ${decoy}`).status, 0, 'the profile denies the decoy');
+  inSandbox(`sed -i '/deny/d' ${config}; : > ${config}; rm -f ${config}`);
+  assert.strictEqual(fs.readFileSync(config, 'utf8'), before, 'the sandbox could not change the configuration');
+  assert.notStrictEqual(inSandbox(`cat ${decoy}`).status, 0, 'a second launch with the same CODEX_HOME still denies the decoy');
+});
+
+test('reviewOnly denies the reviewer every entry of the real home except the way to its checkout, plus the paths named in reviewDenyRead', async () => {
+  const fakeHome = fs.realpathSync(temp());
+  const outside = fs.realpathSync(temp());
+  for (const dir of ['.ssh', '.config/gh', 'proj/other', 'proj/repo']) fs.mkdirSync(path.join(fakeHome, dir), { recursive: true });
+  fs.writeFileSync(path.join(fakeHome, '.bashrc'), 'x');
+  const repo = path.join(fakeHome, 'proj', 'repo');
+  execFileSync('git', ['init', '-q'], { cwd: repo });
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'init'], { cwd: repo });
+  const sourceHome = path.join(fakeHome, '.codex');
+  fs.mkdirSync(sourceHome);
+  fs.writeFileSync(path.join(sourceHome, 'auth.json'), '{}');
+  const h = harness();
+  const seen = [];
+  const cli = (args) => (args[0] === 'findings' ? { findings: [] } : h.cli(args));
+  const spawn = (input) => { const home = input.env && input.env.CODEX_HOME; seen.push(home && fs.readFileSync(path.join(home, 'config.toml'), 'utf8')); return h.spawn(input); };
+  fs.mkdirSync(path.join(fakeHome, '.local', 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(fakeHome, '.local', 'bin', 'other-tool'), '');
+  const linked = fs.realpathSync(temp());
+  fs.symlinkSync(linked, path.join(fakeHome, 'link-out'));
+  fs.symlinkSync('/usr', path.join(fakeHome, 'link-system'));
+  fs.symlinkSync(path.join(fakeHome, '.ssh'), path.join(fakeHome, 'link-in'));
+  fs.writeFileSync(path.join(fakeHome, '.local', 'bin', 'codex'), '');
+  const saved = { HOME: process.env.HOME, CODEX_HOME: process.env.CODEX_HOME, PATH: process.env.PATH };
+  // The runner itself runs with the reviewer's empty HOME, so the real home comes in as an option.
+  process.env.HOME = fs.realpathSync(temp()); process.env.CODEX_HOME = sourceHome; process.env.PATH = `${path.join(fakeHome, '.local', 'bin')}${path.delimiter}${saved.PATH}`;
+  try {
+    await runReviewUntilGreen({ ref: 'feature/codex', base: 'main', repoRoot: repo, runCli: cli, spawn, reviewOnly: true, reviewer: 'codex', noBroad: true, reviewDenyRead: [outside], reviewRealHome: fakeHome });
+  } finally {
+    for (const [key, value] of Object.entries(saved)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
+  assert.ok(seen.length);
+  const denied = (config) => [...config.matchAll(/^"([^"]+)" = "deny"$/gm)].map((m) => m[1]);
+  for (const config of seen) {
+    const list = denied(config);
+    for (const must of ['.ssh', '.config', '.bashrc', 'proj/other', '.codex']) assert.ok(list.includes(path.join(fakeHome, must)), `${must} denied: ${list}`);
+    for (const never of ['', 'proj', 'proj/repo', '.local', '.local/bin']) assert.ok(!list.includes(path.join(fakeHome, never)) && !list.includes(path.join(fakeHome, never) + path.sep), `${never || 'the home itself'} stays reachable`);
+    assert.ok(list.includes(outside), 'a path named in reviewDenyRead is denied');
+    assert.ok(list.includes(linked), 'the target of a link that leaves the home is denied');
+    assert.ok(list.includes(path.join(fakeHome, '.local', 'bin', 'other-tool')), 'only the Codex binary stays readable in its directory');
+    for (const skipped of [path.join(fakeHome, 'link-out'), path.join(fakeHome, 'link-in'), '/usr']) assert.ok(!list.includes(skipped), `${skipped} is not mounted over`);
+  }
 });
 
 test('reviewOnly fails when a reviewer moved HEAD, even with a clean worktree', async () => {
