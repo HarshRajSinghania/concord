@@ -322,7 +322,15 @@ function attempt(repo, pr, ledger, file) {
 
     const diff = git(work, ['diff', '-U3', range.base, 'HEAD']);
     const verdictNow = lib.evaluateApproval(next, snapshot(repo, pr), snap.head);
-    const input = { head: snap.head, round: n, rangeBase: range.base, reviewer: ledger.provider, hunks: publish.hunksOf(diff), findings: fresh, fixed: fixedIds, stillOpen: openIds, previousHead: prior ? prior.head : snap.head, approve: verdictNow.approve };
+    const hunks = publish.hunksOf(diff);
+    // The engine's line is kept whether or not it is in the diff; only a finding without one is looked up by span in the file at the head.
+    const placed = (f) => {
+      if (f.line != null) return f;
+      const blob = f.span ? gitBlob(work, snap.head, f.file) : null;
+      const line = Buffer.isBuffer(blob) ? publish.placeLine(blob.toString('utf8'), f.span, f.file, hunks) : null;
+      return line == null ? f : { ...f, line };
+    };
+    const input = { head: snap.head, round: n, rangeBase: range.base, reviewer: ledger.provider, hunks, findings: fresh.map(placed), fixed: fixedIds, stillOpen: openIds, previousHead: prior ? prior.head : snap.head, approve: verdictNow.approve };
     if (verdictNow.reason === 'head-moved') return null;
     const known = newestId(reviewsOf(repo, pr));
     const entry = (review) => ({ n, head: snap.head, base: range.base, mergeBase: snap.mergeBase, intent: snap.intent, mode: range.broad ? 'broad' : 'diff', reviewId: review.id, submittedAt: review.submitted_at || new Date().toISOString(), commentIds: [], event: input.approve ? 'APPROVE' : 'COMMENT' });
