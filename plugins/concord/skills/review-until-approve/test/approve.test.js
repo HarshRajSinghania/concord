@@ -833,6 +833,26 @@ test('a review that quotes the access or refresh token from the credentials file
   }
 });
 
+test('a repaired multiline span crossing into a diff hunk is published at the first overlapping line', () => {
+  const { prepareAnchors, applyAnchors } = require('../../../core/review-anchors');
+  const w = world();
+  const rows = Array.from({ length: 30 }, (_, index) => `context ${index + 1}`);
+  const base = push(w, { 'a.js': rows.join('\n') + '\n' }, 'long base');
+  w.state.baseTip = base;
+  w.state.mergeBase = base;
+  rows[19] = 'changed line';
+  const text = rows.join('\n') + '\n';
+  push(w, { 'a.js': text }, 'change');
+  const original = { ...finding, span: 'context 10 ... changed line', line: null };
+  const request = prepareAnchors([original], () => text);
+  const corrected = applyAnchors([original], request, { anchors: [{ index: 0, span: rows.slice(9, 21).join('\n') }] });
+  w.write('findings.json', corrected);
+  assert.equal(w.approve('start', 'o/r', '5').status, 0);
+  const round = w.approve('round', 'o/r', '5');
+  assert.equal(round.status, 0, round.stderr);
+  assert.deepEqual(w.posts()[0].comments.map((comment) => comment.line), [17]);
+  assert.equal(w.ledger().findings[0].spanVerified, sh(w.src, 'rev-parse', 'HEAD'));
+});
 // A pull request that bumps a submodule is reviewed on the submodule's own diff.
 const libInfo = (w, lib) => w.write('repos.json', { 'o/r': { private: false }, 'o/lib': lib });
 
@@ -848,6 +868,26 @@ test('a submodule bump is reviewed on the submodule diff: the reviewer sees lib/
 });
 
 const startRound = (w) => { w.approve('start', 'o/r', '5'); return JSON.parse(w.approve('round', 'o/r', '5').stdout); };
+
+test('a repaired root finding is inline while a submodule finding stays in the body', () => {
+  const { prepareAnchors, applyAnchors, readCommittedSource } = require('../../../core/review-anchors');
+  const w = world({}, { sub: {} });
+  libInfo(w, { private: false });
+  const head = sh(w.src, 'rev-parse', 'HEAD');
+  const findings = [
+    { id: 'correctness:root', category: 'correctness', file: 'a.js', line: null, span: 'one ... bad', summary: 'bad root line', requirement: '' },
+    { id: 'correctness:b', category: 'correctness', file: 'lib/f.c', line: 2, span: 'b', summary: 'bad submodule line', requirement: '' },
+  ];
+  const request = prepareAnchors(findings, file => readCommittedSource(w.src, head, file));
+  assert.deepEqual(request.candidates.map(({ index }) => index), [0]);
+  w.write('findings.json', applyAnchors(findings, request, { anchors: [{ index: 0, span: 'bad' }] }));
+
+  const result = startRound(w);
+  assert.equal(result.review, 'COMMENT');
+  assert.deepEqual(w.posts()[0].comments.map(({ path, line }) => [path, line]), [['a.js', 2]]);
+  assert.match(w.posts()[0].body, /`lib\/f\.c:2`/);
+  assert.deepEqual(w.ledger().findings.map(({ spanVerified }) => spanVerified), [head, head]);
+});
 
 test('a finding inside the submodule lands in the review body, is verified, and is fixed by a bump that drops the span', () => {
   const w = world({}, { sub: {} });
