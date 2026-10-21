@@ -54,3 +54,12 @@ test('no doc or script comment describes the Claude Code wait as Monitor-based o
   assert.doesNotMatch(watchHeader, /Token-free|Monitor/);
   assert.doesNotMatch(readmeRow, /no model calls/);
 });
+
+test('SKILL.md never has the model pass a flag, set a variable or edit settings to turn the Claude reviewer on, and stops after a denial', () => {
+  assert.equal(skill.includes('--allow-unrestricted-home'), false);
+  assert.match(skill, /CONCORD_REVIEW_UNCONFINED_CLAUDE/);
+  assert.match(skill, /never (?:type|pass|set|add|edit)[^.]*(?:flag|variable|permission rule|settings)/i);
+  assert.match(skill, /denied[^.]*relay[^.]*stop|relay[^.]*denial[^.]*stop/i);
+  const setup = skill.slice(skill.indexOf('## Setup'), skill.indexOf('## Loop'));
+  assert.doesNotMatch(setup, /pass (?:`)?--/);
+});
