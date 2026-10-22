@@ -125,6 +125,7 @@ else if (a[0] === 'api' && a.includes('-X')) {
   if (fs.existsSync(dir + '/crash-after-post')) { console.error('timeout after GitHub accepted the review'); process.exit(1); }
   j({ id: 100 + posts.length, submitted_at: new Date().toISOString() });
 } else if (a[0] === 'api' && /\\/reviews$/.test(a[a.length - 1])) j([fs.existsSync(dir + '/reviews.json') ? JSON.parse(fs.readFileSync(dir + '/reviews.json', 'utf8')) : []]);
+else if (a[0] === 'api' && /issues\\/\\d+\\/comments$/.test(a[a.length - 1]) && fs.existsSync(dir + '/issue-comments.json')) j([JSON.parse(fs.readFileSync(dir + '/issue-comments.json', 'utf8'))]);
 else if (a[0] === 'api' && fs.existsSync(dir + '/fail-comments')) { console.error('boom'); process.exit(1); }
 else if (a[0] === 'api') j([[{ id: 7 }]]);
 `, { mode: 0o755 });
@@ -1829,4 +1830,117 @@ test('a reopened thread whose reply failed is answered on the next round (#394)'
   w.approve('start', 'o/r', '5');
   w.approve('round', 'o/r', '5');
   assert.deepEqual(w.gql().filter((c) => c.name !== 'thread'), [{ name: 'addPullRequestReviewThreadReply', id: 'T1' }]);
+});
+
+// The base branch gains a commit and the pull request merges it; `edit` runs inside the merge, before it is committed.
+function mergeBase(w, edit, [file, text] = ['b.js', 'base\n']) {
+  sh(w.src, 'checkout', '-q', 'main');
+  fs.writeFileSync(path.join(w.src, file), text);
+  sh(w.src, 'add', file); sh(w.src, 'commit', '-q', '-m', 'base moves');
+  const tip = sh(w.src, 'rev-parse', 'HEAD');
+  sh(w.src, 'checkout', '-q', 'pr');
+  sh(w.src, 'merge', '-q', '--no-ff', '--no-commit', tip);
+  if (edit) { edit(); sh(w.src, 'add', '-A'); }
+  sh(w.src, 'commit', '-q', '-m', 'merge main');
+  const head = sh(w.src, 'rev-parse', 'HEAD');
+  sh(w.src, 'push', '-q', w.bare, 'HEAD:refs/pull/5/head', '-f');
+  Object.assign(w.state, { head, baseTip: tip, mergeBase: tip });
+  w.write('state.json', w.state);
+  return head;
+}
+
+test('a head that only merges the base with the pull request diff unchanged runs no reviewer, posts no review of findings, and approves a clean round (#422)', () => {
+  const w = world();
+  w.write('findings.json', []);
+  w.approve('start', 'o/r', '5');
+  assert.equal(JSON.parse(w.approve('round', 'o/r', '5').stdout).review, 'APPROVE');
+  const merged = mergeBase(w);
+  assert.equal(JSON.parse(w.approve('start', 'o/r', '5').stdout).action, 'round');
+  const r = JSON.parse(w.approve('round', 'o/r', '5').stdout);
+  assert.deepEqual([r.event, r.head], ['base-merge', merged]);
+  assert.equal(w.calls().length, 1);
+  assert.equal(w.posts().length, 2);
+  assert.deepEqual([w.posts()[1].event, w.posts()[1].commit_id], ['APPROVE', merged]);
+  assert.match(w.posts()[1].body, /merges the base branch/);
+  const l = w.ledger();
+  assert.equal(l.approval.head, merged);
+  assert.deepEqual([l.rounds.length, l.rounds[1].n, l.rounds[1].mode, l.rounds[1].head, l.rounds[1].submittedAt === l.rounds[0].submittedAt], [2, 1, 'base-merge', merged, true]);
+});
+
+test('a base-only merge after a round with an open blocker records the head, posts nothing and does not approve (#422)', () => {
+  const w = world();
+  w.write('findings.json', [finding]);
+  w.approve('start', 'o/r', '5');
+  w.approve('round', 'o/r', '5');
+  const merged = mergeBase(w);
+  const r = JSON.parse(w.approve('round', 'o/r', '5').stdout);
+  assert.deepEqual([r.event, r.notApproved], ['base-merge', 'open-blockers']);
+  assert.equal(w.calls().length, 1);
+  assert.equal(w.posts().length, 1);
+  assert.equal(w.ledger().rounds[1].head, merged);
+});
+
+test('a merge whose resolution changes the pull request diff, a merge with another commit after it, and a merge after an author reply each run a round (#422)', () => {
+  for (const how of ['evil', 'extra', 'reply']) {
+    const w = world();
+    w.write('findings.json', []);
+    w.approve('start', 'o/r', '5');
+    w.approve('round', 'o/r', '5');
+    if (how === 'evil') mergeBase(w, () => fs.writeFileSync(path.join(w.src, 'a.js'), 'one\nbad\nthree\nfour\nevil\n'));
+    else {
+      mergeBase(w);
+      if (how === 'extra') push(w, { 'c.js': 'x\n' }, 'extra');
+      else w.write('issue-comments.json', [{ user: { login: 'dev' }, created_at: '2999-01-01T00:00:00Z' }]);
+    }
+    const r = JSON.parse(w.approve('round', 'o/r', '5').stdout);
+    assert.equal(r.event, 'published', how);
+    assert.equal(w.calls().length, 2, how);
+  }
+});
+
+test('base-merge rounds do not count toward the round limit or the round number (#422)', () => {
+  const w = world();
+  w.write('findings.json', []);
+  w.approve('start', 'o/r', '5');
+  w.approve('round', 'o/r', '5');
+  const l = w.ledger();
+  l.rounds = Array.from({ length: 10 }, (_, i) => ({ ...l.rounds[0], n: 1, mode: i ? 'base-merge' : 'broad' }));
+  fs.writeFileSync(path.join(w.dir, 'ledgers', 'o__r__5__bot.json'), JSON.stringify(l));
+  assert.notEqual(JSON.parse(w.approve('round', 'o/r', '5').stdout).event, 'round-limit');
+});
+
+test('a thread is answered with the head of the round that fixed the finding when a base-merge entry precedes it (#422)', () => {
+  const w = world();
+  w.write('findings.json', [finding]);
+  w.approve('start', 'o/r', '5'); w.approve('round', 'o/r', '5');
+  mergeBase(w);
+  assert.equal(JSON.parse(w.approve('round', 'o/r', '5').stdout).event, 'base-merge');
+  const c3 = push(w, { 'a.js': 'one\ngood\nthree\nfour\n' }, 'fix');
+  w.write('findings.json', []);
+  w.approve('start', 'o/r', '5');
+  assert.equal(JSON.parse(w.approve('round', 'o/r', '5').stdout).fixed, 1);
+  assert.ok(w.bodies().some((b) => JSON.stringify(b).includes(`Fixed in \`${c3.slice(0, 7)}\``)), JSON.stringify(w.bodies()));
+});
+
+test('a base edit far from the pull request hunk still skips the round, and a recorded base-merge supersedes a failed attempt (#422)', () => {
+  const w = world();
+  const rows = Array.from({ length: 30 }, (_, i) => `row ${i + 1}`);
+  const at = (edits) => rows.map((r, i) => edits[i] ?? r).join('\n') + '\n';
+  sh(w.src, 'checkout', '-q', 'main');
+  fs.writeFileSync(path.join(w.src, 'long.js'), at({}));
+  sh(w.src, 'add', 'long.js'); sh(w.src, 'commit', '-q', '-m', 'long');
+  sh(w.src, 'checkout', '-q', 'pr');
+  sh(w.src, 'merge', '-q', '--no-ff', '-m', 'merge long', 'main');
+  Object.assign(w.state, { baseTip: sh(w.src, 'rev-parse', 'main'), mergeBase: sh(w.src, 'rev-parse', 'main') });
+  push(w, { 'long.js': at({ 4: 'row 5 by the pull request' }) }, 'pr edit');
+  w.write('findings.json', []);
+  w.approve('start', 'o/r', '5');
+  assert.equal(JSON.parse(w.approve('round', 'o/r', '5').stdout).review, 'APPROVE');
+  const l = w.ledger();
+  l.attempt = { head: w.state.head, at: '2000-01-01T00:00:00Z' };
+  fs.writeFileSync(path.join(w.dir, 'ledgers', 'o__r__5__bot.json'), JSON.stringify(l));
+  mergeBase(w, null, ['long.js', at({ 24: 'row 25 by the base' })]);
+  assert.equal(JSON.parse(w.approve('round', 'o/r', '5').stdout).event, 'base-merge');
+  assert.equal(w.calls().length, 1);
+  assert.equal(w.ledger().attempt, undefined);
 });
