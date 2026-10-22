@@ -54,6 +54,21 @@ test('finding-producing prompts require continuous verbatim spans and preserve s
   }
 });
 
+test('a review language is asked for in the finding text of the finding-producing prompts only, and spans stay verbatim', () => {
+  const context = {
+    stateDir: '/state', round: 1, targetType: 'git', slug: 'feat-x', gateMode: 'pair',
+    fixGroup: { groupId: 'g1', findingIds: ['correctness:a'], rootCause: 'r', invariants: [] },
+    finding: { id: 'correctness:a', summary: 's' }, fixFiles: [],
+  };
+  for (const role of ['correctness', 'verify', 'intent', 'gate', 'gate-verify']) {
+    const prompt = reviewerPrompt(role, { ...context, reviewLanguage: 'ko' });
+    assert.match(prompt, /BCP 47 tag `ko`/, role);
+    assert.match(prompt, /`span`.*never translate/s, role);
+    assert.doesNotMatch(reviewerPrompt(role, context), /BCP 47/, role);
+  }
+  for (const role of ['plan', 'fix', 'certify']) assert.doesNotMatch(reviewerPrompt(role, { ...context, reviewLanguage: 'ko' }), /BCP 47/, role);
+});
+
 test('GATE_SWEEP_CLAUSE is non-trivial and role-agnostic text', () => {
   assert.equal(typeof GATE_SWEEP_CLAUSE, 'string');
   assert.ok(GATE_SWEEP_CLAUSE.length > 40, 'GATE_SWEEP_CLAUSE should be a real instruction, not a stub');
@@ -295,4 +310,10 @@ test('every manual driver copy carries the sandbox uid note for each probe role,
       assert.ok(text.includes(`For ${label}:\n\n>${clause}`), `${name} sandbox note for ${label} has drifted from round-plan.js ENV_CLAUSE_BY_ROLE`);
     }
   }
+});
+
+test('gate-panel lens prompt carries the review-language clause', () => {
+  assert.equal(typeof require(path.join(CORE, 'round-plan')).reviewLanguageClause, 'function');
+  const runner = fs.readFileSync(path.join(CORE, 'codex-review-runner.js'), 'utf8');
+  assert.match(runner, /gate:\$\{lens\}:<slug>\.\$\{reviewLanguageClause\(context\.reviewLanguage\)\}\$\{BLOCKED_CLAUSE\}/);
 });
