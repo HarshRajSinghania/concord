@@ -104,7 +104,14 @@ test('evaluateApproval: approves only a reviewed, open, non-draft head with no o
   assert.equal(no(ledger(), { ...live, isDraft: true }).reason, 'draft');
   assert.equal(no(ledger(), { ...live, author: 'bot' }).reason, 'self-review');
   assert.equal(no(ledger({ approval: { head: 'h1' } }), live).reason, 'already-approved');
-  assert.equal(no(ledger({ findings: [{ ...finding('a', 'x', 's'), status: 'open' }] }), live).reason, 'open-findings');
+  assert.equal(no(ledger({ findings: [{ ...finding('a', 'x', 's'), status: 'open' }] }), live).reason, 'open-blockers');
+  // Only an explicit minor class lets an open finding through; a missing or any other class blocks.
+  const open = (extra) => ledger({ findings: [{ ...finding('a', 'x', 's'), status: 'open', ...extra }] });
+  assert.deepEqual(no(open({ class: 'minor', reason: 'wording only' }), live), { approve: true });
+  assert.equal(no(open({ class: 'blocker', reason: 'r' }), live).reason, 'open-blockers');
+  assert.equal(no(open({ class: 'Minor' }), live).reason, 'open-blockers');
+  assert.equal(no(open({ class: undefined }), live).reason, 'open-blockers');
+  assert.equal(no(ledger({ findings: [{ ...finding('a', 'x', 's'), status: 'open', class: 'minor' }, { ...finding('b', 'x', 't'), status: 'open' }] }), live).reason, 'open-blockers');
   assert.deepEqual(no(ledger({ findings: [{ ...finding('a', 'x', 's'), status: 'waived' }, { ...finding('b', 'x', 't'), status: 'fixed' }] }), live), { approve: true });
 });
 
@@ -192,4 +199,11 @@ test('an unreviewed submodule range keeps the round from approving its head and 
   assert.equal(lib.evaluateApproval(ledger, { head: 'h1', state: 'OPEN', isDraft: false, author: 'dev' }, 'h1').reason, 'unreviewed-submodule');
   assert.equal(lib.evaluateApproval({ ...ledger, rounds: [{ ...ledger.rounds[0], head: 'h0' }] }, { head: 'h1', state: 'OPEN', isDraft: false, author: 'dev' }, 'h1').approve, true);
   assert.deepEqual(lib.chooseRange(ledger.rounds[0], { head: 'h2', mergeBase: 'm', intent: 'i' }, () => true), { base: 'm', broad: false });
+});
+
+test('classOf: the gate verifier\'s blocking reason replaces the finder\'s non-blocking rationale; without one the rationale stands', () => {
+  const overridden = lib.classOf({ class: 'blocker', releaseBlocking: [], rationale: 'wording only', blockingReason: 'it breaks callers' });
+  assert.deepEqual([overridden.class, overridden.reason], ['blocker', 'it breaks callers']);
+  assert.equal(lib.classOf({ class: 'minor', releaseBlocking: [], rationale: 'wording only', blockingReason: 'x' }).class, 'blocker');
+  assert.equal(lib.classOf({ class: 'blocker', releaseBlocking: ['serious-bug'], rationale: 'breaks login' }).reason, 'breaks login');
 });
