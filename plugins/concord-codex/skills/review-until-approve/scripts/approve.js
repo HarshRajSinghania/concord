@@ -25,7 +25,6 @@ process.env.GIT_NO_REPLACE_OBJECTS = '1';
 
 const MAX_ROUNDS = 10;
 const MAX_DISCARDS = 3;
-const GUIDANCE_FINDINGS = 20;
 // The Claude reviewer is unconfined (#366), so it runs only on a pull request the user declared trusted: `trust` records the user's own confirming words in that pull request's ledger.
 // Under Claude Code the Claude reviewer runs as subagents of the session that drives the skill, with the session's own login, so it needs no `claude` binary and no credentials of its own.
 const subagents = () => !!process.env.CLAUDECODE;
@@ -145,6 +144,7 @@ function settlePending(repo, pr, ledger, file, reviewer) {
     if (round && round.n === ledger.rounds.length + 1) ledger.rounds.push({ ...round, reviewId: review.id, submittedAt: at });
     if (findings) ledger.findings = findings;
     ledger.approval = { head, reviewId: review.id, at };
+    delete ledger.attempt;
   }
   delete ledger.pending;
   save(file, ledger);
@@ -218,11 +218,8 @@ function start(repo, pr, args) {
   outFor(ledger, { ledger: file, action, round: ledger.rounds.length + 1, reviewer: provider, ...(ledger.model && { model: ledger.model }), ...(ledger.language && { language: ledger.language }), ...(ledger.effort && { effort: ledger.effort }), ...(warning && { warning }) });
 }
 
-// The findings the reviewer is told about. Telling it decides nothing: a finding is fixed by the code, never by the reviewer's silence.
-function guidance(open) {
-  if (!open.length) return undefined;
-  return `Earlier findings on this pull request. If one is still present at this head, raise it again with the same id and the current path: ${open.slice(0, GUIDANCE_FINDINGS).map((f) => `${f.id} (${f.file}): ${f.summary.slice(0, 200)}`).join('; ')}`;
-}
+// The findings the reviewer is told about. Telling it decides nothing: a finding is fixed by the code, never by the reviewer's silence. The runner gives each role only the ids of its own artifact.
+const priorFindings = (open) => open.map((f) => ({ id: f.id, file: f.file, summary: f.summary }));
 
 const MAX_SPAN_FILE_BYTES = 20 * 1024 * 1024;
 // A file as stored in the git object of `rev`, never from the working tree: a Buffer, null when the path is
@@ -349,10 +346,11 @@ function reviewRound(repo, pr, args) {
 function attempt(repo, pr, ledger, file) {
   const snap = snapshot(repo, pr);
   if (snap.state !== 'OPEN') return { event: snap.state.toLowerCase() };
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-until-approve-'));
-  const work = path.join(dir, 'work');
-  const remote = `${process.env.REVIEW_APPROVE_REMOTE || 'https://github.com'}/${repo}.git`;
+  let dir;
   try {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-until-approve-'));
+    const work = path.join(dir, 'work');
+    const remote = `${process.env.REVIEW_APPROVE_REMOTE || 'https://github.com'}/${repo}.git`;
     // Written before anything slow, so `next` never finds no round while this one is still setting up; it is removed when the process ends, and a pid that is gone is not a running round.
     const brokerDir = ledger.provider === 'claude' && subagents() ? path.join(dir, 'broker') : null;
     if (brokerDir) {
@@ -399,7 +397,7 @@ function attempt(repo, pr, ledger, file) {
     const realClaudeConfig = claudeConfigDir();
     const claudeConfig = fs.mkdtempSync(path.join(dir, 'claude-'));
     const reviewerHome = fs.mkdtempSync(path.join(dir, 'home-'));
-    const runnerOptions = { ref: `concord-pr-${pr}`, base: range.base, broad: range.broad, noBroad: !range.broad, reviewer: ledger.provider, reviewerModel: ledger.model || undefined, reasoningEffort: ledger.effort || undefined, reviewLanguage: ledger.language || undefined, reviewDenyRead: [realClaudeConfig], reviewRealHome: os.homedir(), reviewerGuidance: guidance(shown), intentFile: range.broad ? intentFile : undefined };
+    const runnerOptions = { ref: `concord-pr-${pr}`, base: range.base, broad: range.broad, noBroad: !range.broad, reviewer: ledger.provider, reviewerModel: ledger.model || undefined, reasoningEffort: ledger.effort || undefined, reviewLanguage: ledger.language || undefined, reviewDenyRead: [realClaudeConfig], reviewRealHome: os.homedir(), priorFindings: priorFindings(shown), intentFile: range.broad ? intentFile : undefined };
     const env = reviewerEnv(ledger.provider, claudeConfig, reviewerHome, realClaudeConfig);
     const runner = process.env.REVIEW_APPROVE_RUNNER || path.join(__dirname, 'run-review.js');
     // The runner waits in `dir/broker` for the session to answer each request; `next` finds that directory through the run file.
@@ -477,6 +475,7 @@ function attempt(repo, pr, ledger, file) {
     // Saved before anything else can fail, so a posted review (an APPROVE above all) is never forgotten.
     next.rounds.push(entry(review));
     delete next.pending;
+    delete next.attempt;
     if (input.approve) next.approval = { head: snap.head, reviewId: review.id, at: next.rounds[next.rounds.length - 1].submittedAt };
     save(file, next);
     // Best effort: replies to a thread are recognized by these ids; without them only conversation replies count.
@@ -485,7 +484,11 @@ function attempt(repo, pr, ledger, file) {
       save(file, next);
     } catch (_) { /* ponytail: ids stay empty; thread replies are then missed until the next round */ }
     return { event: 'published', round: n, mode: range.broad ? 'broad' : 'diff', review: input.approve ? 'APPROVE' : 'COMMENT', new: fresh.length, fixed: fixedIds.length, stillOpen: openIds.length, open: openNow, ...(unreviewed.length && { unreviewed }), ...(verdictNow.approve ? {} : { notApproved: verdictNow.reason }), ...(held.length && { held, hint: 'These findings cannot be settled from the code; run waive <key> (or waive <id> when the id is unique) to clear one you accept.' }) };
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  } catch (error) {
+    // Any failure after the head snapshot is recorded with the head it tried, so the watch waits for a newer head or reply; the ledger is read again because a pending approval marker may have been saved meanwhile.
+    save(file, { ...load(file), attempt: { head: snap.head, at: new Date().toISOString() } });
+    throw error;
+  } finally { if (dir) fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
 const runFile = (file) => `${file}.run.json`;

@@ -120,6 +120,7 @@ function evaluateApproval(ledger, live, reviewedHead) {
 // Author replies after the last review: in a thread of a review we published, or
 // on the PR conversation (the only way to answer a finding posted in a review body).
 function repliesSince(ledger, pullComments, issueComments, author) {
+  if (!ledger.rounds.length) return [];
   const ours = new Set(ledger.rounds.flatMap((r) => r.commentIds));
   const since = Date.parse(last(ledger).submittedAt);
   return [
@@ -133,10 +134,15 @@ function repliesSince(ledger, pullComments, issueComments, author) {
 function wakeDecision({ ledger, live, replies, now, stable }) {
   if (live.state === 'MERGED') return { event: 'merged' };
   if (live.state === 'CLOSED') return { event: 'closed' };
+  // No round was published (the first one failed): there is no review to answer, so only a head newer than the attempt asks for a round.
+  if (!ledger.rounds.length) return ledger.attempt && live.head !== ledger.attempt.head && stable ? { event: 'round', head: live.head } : null;
   const lastRound = last(ledger);
   const age = now - Date.parse(lastRound.submittedAt);
   if (age >= TIMEOUT_MS) return { event: 'timeout' };
   const pushed = live.head !== lastRound.head;
+  // A round that failed at this head used every reply up to its time: only a newer head or reply asks for another.
+  const attempt = ledger.attempt;
+  if (attempt && live.head === attempt.head && !replies.some((at) => Date.parse(at) > Date.parse(attempt.at))) return null;
   const replied = replies.length > 0;
   if (pushed && replied) return stable ? { event: 'round', head: live.head } : null;
   if (!pushed && !replied) return null;
