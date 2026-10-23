@@ -318,3 +318,33 @@ test('baseMergeOnly: only merges of the base branch over an unchanged pull reque
   };
   for (const [why, extra] of Object.entries(no)) assert.equal(lib.baseMergeOnly(facts(extra)), false, why);
 });
+
+const descOpen = { ...finding('gate:d', '/pr-description', 'x'), status: 'open' };
+test('wakeDecision: an edited description wakes a round only while a description finding is open or addressed, once the head and description are stable (#423)', () => {
+  const edited = { live: live({ intent: 'i2' }), ledger: waiting({ findings: [descOpen], rounds: [{ n: 1, head: 'h1', intent: 'i1', submittedAt: '2026-01-01T00:00:00Z' }] }) };
+  assert.deepEqual(wake({ ...edited }), { event: 'round', head: 'h1' });
+  assert.equal(wake({ ...edited, stable: false }), null);
+  assert.equal(wake({ ...edited, live: live({ intent: 'i1' }) }), null);
+  // An addressed description finding is judged again against the edited text; with none open or addressed the edit wakes no round.
+  assert.deepEqual(wake({ ...edited, ledger: waiting({ findings: [{ ...descOpen, status: 'addressed' }], rounds: edited.ledger.rounds }) }), { event: 'round', head: 'h1' });
+  assert.deepEqual(wake({ ...edited, ledger: waiting({ findings: [{ ...descOpen, status: 'fixed' }], rounds: edited.ledger.rounds }) }), { event: 'ready', head: 'h1' });
+  assert.equal(wake({ ...edited, ledger: waiting({ findings: [{ ...finding('c', 'a.js', 's'), status: 'open' }], rounds: edited.ledger.rounds }) }), null);
+});
+
+test('wakeDecision: a failed round at an unchanged head and description waits; a newer description asks again (#423)', () => {
+  const l = waiting({ findings: [descOpen], rounds: [{ n: 1, head: 'h1', intent: 'i1', submittedAt: '2026-01-01T00:00:00Z' }], attempt: { head: 'h1', intent: 'i2', at: '2026-01-01T00:30:00Z' } });
+  assert.equal(wake({ ledger: l, live: live({ intent: 'i2' }) }), null);
+  assert.deepEqual(wake({ ledger: l, live: live({ intent: 'i3' }) }), { event: 'round', head: 'h1' });
+});
+
+test('intentOf is the hash of the title and body that snapshot records', () => {
+  assert.equal(lib.intentOf('T', 'B'), lib.sha('T\n\nB'));
+});
+
+test('classifyPrior: a quote with the replacement characters is matched as the text when the description really holds them, else restored (#423)', () => {
+  const finding1 = { key: 'k', id: 'gate:d', file: '/pr-description', span: 'old claim', spanVerified: 'h0', status: 'open' };
+  const closes = (text, quote) => lib.classifyPrior([finding1], [], () => ({ renames: new Map(), live: new Set() }), (f) => f === '/pr-description' ? Buffer.from(`old claim ${text}`) : null, 'h1',
+    [{ id: 'gate:d', evidence: { file: '/pr-description', span: quote, reason: 'r' } }])[0];
+  assert.equal(closes('uses a∕b here', 'uses a∕b here').evidence.span, 'uses a∕b here');
+  assert.equal(closes('uses a/b here', 'uses a∕b here').evidence.span, 'uses a/b here');
+});
